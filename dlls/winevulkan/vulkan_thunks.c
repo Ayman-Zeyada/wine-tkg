@@ -58736,6 +58736,43 @@ static NTSTATUS thunk32_vkMapMemory(void *args)
 
     ppData_host = UlongToPtr(*(PTR32 *)UlongToPtr(params->ppData));
     params->result = vk_funcs->p_vkMapMemory((VkDevice)UlongToPtr(params->device), params->memory, params->offset, params->size, params->flags, &ppData_host);
+
+    if (params->result == VK_SUCCESS && proxy_memory_enabled)
+    {
+        /* Check if returned address needs proxy (> 32-bit) */
+        if ((ULONG_PTR)ppData_host > 0xFFFFFFFF)
+        {
+            struct proxy_memory_mapping *mapping;
+
+            TRACE("Mali GPU returned 64-bit address %p, creating proxy mapping\n", ppData_host);
+
+            /* Create proxy memory mapping */
+            mapping = create_proxy_mapping(params->memory, ppData_host, params->size);
+
+            if (mapping)
+            {
+                /* Return 32-bit proxy address instead of Mali address */
+                ppData_host = mapping->proxy_ptr;
+
+                /* Initial sync: GPU → Proxy if readable */
+                if (!(params->flags & VK_MEMORY_MAP_WRITE_BIT))
+                {
+                    TRACE("Initial sync: copying %lu bytes from GPU %p to proxy %p\n",
+                          (unsigned long)params->size, mapping->gpu_ptr, mapping->proxy_ptr);
+                    memcpy(mapping->proxy_ptr, mapping->gpu_ptr, params->size);
+                }
+            }
+            else
+            {
+                /* Fallback: return error if proxy creation fails */
+                WARN("Failed to create proxy mapping, unmapping GPU memory\n");
+                vk_funcs->p_vkUnmapMemory((VkDevice)UlongToPtr(params->device), params->memory);
+                params->result = VK_ERROR_OUT_OF_HOST_MEMORY;
+                ppData_host = NULL;
+            }
+        }
+    }
+
     *(PTR32 *)UlongToPtr(params->ppData) = PtrToUlong(ppData_host);
     return STATUS_SUCCESS;
 }
@@ -60126,9 +60163,33 @@ static NTSTATUS thunk32_vkUnmapMemory(void *args)
         PTR32 device;
         VkDeviceMemory DECLSPEC_ALIGN(8) memory;
     } *params = args;
+    struct proxy_memory_mapping *mapping = NULL;
 
     TRACE("%#x, 0x%s\n", params->device, wine_dbgstr_longlong(params->memory));
 
+    if (proxy_memory_enabled)
+    {
+        /* Check if this memory has proxy mapping */
+        mapping = find_proxy_mapping(params->memory);
+
+        if (mapping)
+        {
+            TRACE("Found proxy mapping for memory, syncing proxy %p to GPU %p\n",
+                  mapping->proxy_ptr, mapping->gpu_ptr);
+
+            /* Sync proxy → GPU before unmapping */
+            memcpy(mapping->gpu_ptr, mapping->proxy_ptr, mapping->size);
+
+            /* Unmap the actual Mali memory */
+            vk_funcs->p_vkUnmapMemory((VkDevice)UlongToPtr(params->device), params->memory);
+
+            /* Clean up proxy mapping */
+            destroy_proxy_mapping(mapping);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    /* Standard path for non-proxy memory */
     vk_funcs->p_vkUnmapMemory((VkDevice)UlongToPtr(params->device), params->memory);
     return STATUS_SUCCESS;
 }
@@ -62407,3 +62468,85 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     thunk32_vkWriteMicromapsPropertiesEXT,
 };
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_count);
+
+/* Mali 32-bit compatibility proxy memory management functions */
+
+static struct proxy_memory_mapping *find_proxy_mapping(VkDeviceMemory memory)
+{
+    struct proxy_memory_mapping *mapping;
+
+    if (!proxy_registry) return NULL;
+
+    EnterCriticalSection(&proxy_registry->lock);
+    LIST_FOR_EACH_ENTRY(mapping, &proxy_registry->mappings, struct proxy_memory_mapping, entry)
+    {
+        if (mapping->memory == memory)
+        {
+            LeaveCriticalSection(&proxy_registry->lock);
+            return mapping;
+        }
+    }
+    LeaveCriticalSection(&proxy_registry->lock);
+    return NULL;
+}
+
+static struct proxy_memory_mapping *create_proxy_mapping(VkDeviceMemory memory, void *gpu_ptr, size_t size)
+{
+    struct proxy_memory_mapping *mapping;
+
+    if (!proxy_registry) return NULL;
+
+    mapping = calloc(1, sizeof(*mapping));
+    if (!mapping) return NULL;
+
+    /* Allocate 32-bit accessible memory using Windows APIs */
+    mapping->proxy_ptr = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!mapping->proxy_ptr)
+    {
+        free(mapping);
+        return NULL;
+    }
+
+    /* Verify proxy memory is in 32-bit range */
+    if ((ULONG_PTR)mapping->proxy_ptr > 0xFFFFFFFF)
+    {
+        WARN("Proxy memory allocation %p exceeds 32-bit range\n", mapping->proxy_ptr);
+        VirtualFree(mapping->proxy_ptr, 0, MEM_RELEASE);
+        free(mapping);
+        return NULL;
+    }
+
+    mapping->gpu_ptr = gpu_ptr;
+    mapping->size = size;
+    mapping->memory = memory;
+    mapping->dirty = FALSE;
+
+    /* Add to registry */
+    EnterCriticalSection(&proxy_registry->lock);
+    list_add_tail(&proxy_registry->mappings, &mapping->entry);
+    LeaveCriticalSection(&proxy_registry->lock);
+
+    TRACE("Created proxy mapping: GPU %p -> Proxy %p (size: %lu)\n",
+          gpu_ptr, mapping->proxy_ptr, (unsigned long)size);
+
+    return mapping;
+}
+
+static void destroy_proxy_mapping(struct proxy_memory_mapping *mapping)
+{
+    if (!mapping || !proxy_registry) return;
+
+    TRACE("Destroying proxy mapping: GPU %p -> Proxy %p\n",
+          mapping->gpu_ptr, mapping->proxy_ptr);
+
+    /* Remove from registry */
+    EnterCriticalSection(&proxy_registry->lock);
+    list_remove(&mapping->entry);
+    LeaveCriticalSection(&proxy_registry->lock);
+
+    /* Free proxy memory */
+    if (mapping->proxy_ptr)
+        VirtualFree(mapping->proxy_ptr, 0, MEM_RELEASE);
+
+    free(mapping);
+}
