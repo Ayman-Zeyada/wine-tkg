@@ -26,29 +26,8 @@
 #include "vulkan_thunks.h"
 
 #include "wine/rbtree.h"
-#include "wine/vulkan_driver.h"
 
 extern const struct vulkan_funcs *vk_funcs;
-
-/* Mali 32-bit compatibility proxy memory structures */
-struct proxy_memory_mapping
-{
-    void *gpu_ptr;           /* Mali's 64-bit memory pointer */
-    void *proxy_ptr;         /* 32-bit accessible memory */
-    size_t size;             /* Memory region size */
-    VkDeviceMemory memory;   /* Associated VkDeviceMemory handle */
-    BOOL dirty;              /* Needs sync from proxy to GPU */
-    struct list entry;       /* For registry management */
-};
-
-struct proxy_memory_registry
-{
-    struct list mappings;
-    CRITICAL_SECTION lock;
-};
-
-extern BOOL proxy_memory_enabled;
-extern struct proxy_memory_registry *proxy_registry;
 
 struct wine_queue
 {

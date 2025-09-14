@@ -67,10 +67,6 @@ static BOOL use_external_memory(void)
 
 static ULONG_PTR zero_bits = 0;
 
-/* Mali 32-bit compatibility global variables */
-BOOL proxy_memory_enabled = FALSE;
-struct proxy_memory_registry *proxy_registry = NULL;
-
 #define wine_vk_count_struct(s, t) wine_vk_count_struct_((void *)s, VK_STRUCTURE_TYPE_##t)
 static uint32_t wine_vk_count_struct_(void *s, VkStructureType t)
 {
@@ -634,24 +630,6 @@ NTSTATUS init_vulkan(void *arg)
 
         NtQuerySystemInformation(SystemEmulationBasicInformation, &info, sizeof(info), NULL);
         zero_bits = (ULONG_PTR)info.HighestUserAddress | 0x7fffffff;
-    }
-
-    /* Initialize Mali 32-bit compatibility proxy memory system */
-    if (getenv("WINE_VULKAN_PROXY_MEMORY"))
-    {
-        proxy_memory_enabled = TRUE;
-        proxy_registry = malloc(sizeof(*proxy_registry));
-        if (proxy_registry)
-        {
-            list_init(&proxy_registry->mappings);
-            InitializeCriticalSection(&proxy_registry->lock);
-            TRACE("Mali proxy memory system enabled\n");
-        }
-        else
-        {
-            ERR("Failed to allocate proxy memory registry\n");
-            proxy_memory_enabled = FALSE;
-        }
     }
 
     return STATUS_SUCCESS;
